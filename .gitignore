@@ -1,0 +1,36 @@
+# Python cache and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Secrets and local configuration
+.env
+.env.*
+.streamlit/secrets.toml
+
+# User uploads and generated runtime data
+data/uploads/*
+data/images/*
+data/vector_db/*
+data/sqlite.db
+outputs/detected_images/*
+outputs/generated_reports/*
+outputs/logs/*
+
+# Keep directory placeholders
+!data/uploads/.gitkeep
+!data/images/.gitkeep
+!data/vector_db/.gitkeep
+!outputs/detected_images/.gitkeep
+!outputs/generated_reports/.gitkeep
+!outputs/logs/.gitkeep
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/

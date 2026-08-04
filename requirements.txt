@@ -1,0 +1,31 @@
+# AI 多模态学习助手 - Python 依赖（精确版本）
+# 安装：pip install -r requirements.txt
+# 说明：带版本号的为当前验证可用的版本；未锁版本的包请安装最新稳定版
+
+# Web 框架
+streamlit==1.60.0
+
+# 环境配置
+python-dotenv==1.2.2
+
+# RAG 检索增强（以下三个包需安装最新稳定版，当前全局环境未锁定版本）
+langchain
+chromadb
+sentence-transformers
+
+# LLM 调用
+openai==2.52.0
+dashscope
+
+# YOLO 目标检测
+ultralytics==8.4.108
+pillow==12.2.0
+
+# 文件解析
+pypdf==6.14.2
+python-pptx==1.0.2
+markdown==3.10.2
+
+# 数据处理
+numpy==2.4.6
+pandas==3.0.3
