@@ -11,6 +11,7 @@ env/
 # Secrets and local configuration
 .env
 .env.*
+!.env.example
 .streamlit/secrets.toml
 
 # User uploads and generated runtime data
