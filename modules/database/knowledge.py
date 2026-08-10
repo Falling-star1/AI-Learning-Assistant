@@ -1,4 +1,5 @@
 import sqlite3
+import shutil
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
@@ -147,13 +148,19 @@ def delete_knowledge_base(
     init_knowledge_tables(db_path)
     with closing(sqlite3.connect(db_path)) as conn:
         row = conn.execute(
-            "SELECT is_active FROM knowledge_bases WHERE kb_id = ?",
+            "SELECT is_active, store_path FROM knowledge_bases WHERE kb_id = ?",
             (kb_id,),
         ).fetchone()
         if row is None:
             return False
 
         was_active = bool(row[0])
+        store_path = Path(str(row[1]))
+        file_rows = conn.execute(
+            "SELECT storage_path FROM knowledge_base_files WHERE kb_id = ?",
+            (kb_id,),
+        ).fetchall()
+        storage_paths = [Path(str(file_row[0])) for file_row in file_rows]
         now = datetime.now().isoformat(timespec="seconds")
         conn.execute("DELETE FROM knowledge_base_files WHERE kb_id = ?", (kb_id,))
         conn.execute("DELETE FROM knowledge_bases WHERE kb_id = ?", (kb_id,))
@@ -172,6 +179,8 @@ def delete_knowledge_base(
                     (now, str(fallback[0])),
                 )
         conn.commit()
+    _remove_knowledge_base_files(storage_paths)
+    _remove_vector_store(store_path, kb_id)
     return True
 
 
@@ -242,6 +251,29 @@ def delete_knowledge_base_file(
         )
         conn.commit()
     return True
+
+
+def _remove_knowledge_base_files(paths: list[Path]) -> None:
+    for path in paths:
+        if path.exists() and path.is_file():
+            path.unlink()
+        _remove_empty_parent(path.parent)
+
+
+def _remove_vector_store(store_path: Path, kb_id: str) -> None:
+    if store_path.is_file():
+        store_path.unlink()
+
+    store_dir = store_path if store_path.is_dir() else store_path.parent
+    if store_dir.exists() and store_dir.name == kb_id:
+        shutil.rmtree(store_dir)
+
+
+def _remove_empty_parent(path: Path) -> None:
+    try:
+        path.rmdir()
+    except OSError:
+        pass
 
 def _kb_from_row(row: tuple[object, ...]) -> KnowledgeBase:
     return KnowledgeBase(

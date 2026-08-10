@@ -29,6 +29,41 @@ class LLMProviderTests(unittest.TestCase):
         self.assertIn("# 本地环境设置地址", result.text)
         self.assertNotIn("[引用片段 1]\n#", result.text)
 
+    def test_fallback_provider_returns_friendly_chat_for_greeting(self):
+        from modules.llm.provider import FallbackLLMProvider
+
+        provider = FallbackLLMProvider()
+        result = provider.generate(prompt="你好")
+
+        self.assertIn("你好", result.text)
+        self.assertIn("课程资料", result.text)
+        self.assertNotIn("未检测到可用的大模型 API Key", result.text)
+
+    def test_fallback_provider_answers_simple_math_without_api_warning(self):
+        from modules.llm.provider import FallbackLLMProvider
+
+        provider = FallbackLLMProvider()
+        result = provider.generate(prompt="1+1等于几")
+
+        self.assertIn("2", result.text)
+        self.assertNotIn("未检测到可用的大模型 API Key", result.text)
+
+    def test_fallback_provider_surfaces_conversation_history_for_follow_up(self):
+        from modules.llm.provider import FallbackLLMProvider
+
+        provider = FallbackLLMProvider()
+        result = provider.generate(
+            prompt="那它有什么作用？",
+            conversation_history=[
+                {"role": "user", "content": "CPU 是什么？"},
+                {"role": "assistant", "content": "CPU 是中央处理器。"},
+            ],
+        )
+
+        self.assertIn("CPU 是什么", result.text)
+        self.assertIn("CPU 是中央处理器", result.text)
+        self.assertIn("当前问题：那它有什么作用？", result.text)
+
     def test_factory_uses_fallback_when_legacy_qwen_api_key_missing(self):
         from modules.llm.provider import FallbackLLMProvider, create_llm_provider
 
@@ -59,10 +94,56 @@ class LLMProviderTests(unittest.TestCase):
         from modules.llm.provider import LLMResult
 
         class StubProvider:
-            def generate(self, prompt, context_chunks=None):
+            def generate(self, prompt, context_chunks=None, conversation_history=None):
                 return LLMResult(text=f"answer: {prompt}", provider="stub")
 
         self.assertEqual(chat_with_llm("你好", provider=StubProvider()), "answer: 你好")
+
+    def test_cloud_provider_sends_conversation_history_before_current_prompt(self):
+        from modules.llm.provider import CloudLLMProvider
+
+        calls = []
+
+        class FakeMessage:
+            def __init__(self, content):
+                self.content = content
+
+        class FakeChoice:
+            def __init__(self, content):
+                self.message = FakeMessage(content)
+
+        class FakeResponse:
+            def __init__(self, content):
+                self.choices = [FakeChoice(content)]
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                calls.append(kwargs)
+                return FakeResponse("我记得你刚才说过 CPU。")
+
+        class FakeChat:
+            def __init__(self):
+                self.completions = FakeCompletions()
+
+        class FakeOpenAIClient:
+            def __init__(self):
+                self.chat = FakeChat()
+
+        provider = CloudLLMProvider(api_key="test-key", client=FakeOpenAIClient())
+        result = provider.generate(
+            "那它的作用是什么？",
+            conversation_history=[
+                {"role": "user", "content": "CPU 是什么？"},
+                {"role": "assistant", "content": "CPU 是中央处理器。"},
+            ],
+        )
+
+        messages = calls[0]["messages"]
+        self.assertEqual(result.text, "我记得你刚才说过 CPU。")
+        self.assertEqual([message["role"] for message in messages], ["system", "user", "assistant", "user"])
+        self.assertEqual(messages[1]["content"], "CPU 是什么？")
+        self.assertEqual(messages[2]["content"], "CPU 是中央处理器。")
+        self.assertEqual(messages[3]["content"], "那它的作用是什么？")
 
     def test_deepseek_provider_remains_as_compatibility_alias(self):
         from modules.llm.provider import DeepSeekLLMProvider

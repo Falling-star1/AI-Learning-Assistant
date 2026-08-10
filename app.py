@@ -1,9 +1,12 @@
+import sqlite3
+import sys
 from html import escape
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()  # 读取项目根目录下的 .env 文件，让通用 LLM 配置生效
+if "unittest" not in sys.modules:
+    load_dotenv()  # 读取项目根目录下的 .env 文件，让通用 LLM 配置生效
 
 import streamlit as st
 
@@ -27,6 +30,7 @@ from modules.database.sessions import (
     ensure_default_session,
     list_sessions,
     maybe_update_session_title,
+    update_session_title,
     update_session_active_kb,
 )
 from modules.rag.loader import DocumentLoadError
@@ -40,11 +44,27 @@ MODE_COURSE_QA = "课程资料问答"
 MODE_IMAGE = "图片目标检测"
 MODE_REPORT = "学习辅助生成"
 MODE_CHAT = "普通问答"
+MODE_DESCRIPTIONS = {
+    MODE_AUTO: "自动判断问题类型并选择合适能力",
+    MODE_COURSE_QA: "基于上传资料回答问题",
+    MODE_IMAGE: "上传图片识别图中物体",
+    MODE_REPORT: "生成复习提纲、练习题等",
+    MODE_CHAT: "直接对话，不检索知识库",
+}
+CHAT_INPUT_LIMIT = 1200
+CHAT_PLACEHOLDERS = {
+    MODE_AUTO: "输入学习问题，AI 会自动选择合适模式…",
+    MODE_COURSE_QA: "输入关于课程资料的问题…",
+    MODE_IMAGE: "上传图片并描述检测需求…",
+    MODE_REPORT: "例如：生成 CPU 章节的复习提纲…",
+    MODE_CHAT: "直接输入你的问题…",
+}
+NO_RETRIEVAL_NOTICE = "当前知识库中没有检索到相关片段，请先上传课程资料或换一种问法。"
 LLM_PROVIDER_OPTIONS = {
-    "自动": "auto",
-    "云端 API": "cloud",
-    "本地 fallback": "fallback",
-    "本地模型": "ollama",
+    "自动（推荐）": "auto",
+    "云端模型": "cloud",
+    "本地 Ollama": "ollama",
+    "离线兜底（无模型）": "fallback",
 }
 DEFAULT_STATUS = {
     "status": "empty",
@@ -54,8 +74,28 @@ DEFAULT_STATUS = {
 }
 
 
-def chat_records_to_messages(records: list[ChatRecord]) -> list[dict[str, str]]:
-    return [{"role": record.role, "content": record.content} for record in records]
+def chat_records_to_messages(records: list[ChatRecord]) -> list[dict[str, object]]:
+    messages = []
+    for record in records:
+        message = {"role": record.role, "content": record.content}
+        if record.metadata:
+            message.update(record.metadata)
+        messages.append(message)
+    return messages
+
+
+def build_conversation_history(
+    messages: list[dict[str, object]],
+    limit: int = 8,
+) -> list[dict[str, str]]:
+    history = []
+    for message in messages:
+        role = message.get("role")
+        content = str(message.get("content", "")).strip()
+        if role not in {"user", "assistant"} or not content:
+            continue
+        history.append({"role": str(role), "content": content})
+    return history[-limit:]
 
 
 def format_session_label(session: ChatSession) -> str:
@@ -92,12 +132,14 @@ def init_session_state() -> None:
     st.session_state.setdefault("session_id", session.session_id)
     st.session_state.setdefault("last_indexed_upload", "")
     st.session_state.setdefault("llm_provider_name", "auto")
+    st.session_state.setdefault("system_notice", "")
+    st.session_state.setdefault("pending_question", "")
     if "messages" not in st.session_state:
         st.session_state.messages = load_session_messages(st.session_state.session_id)
     refresh_knowledge_status()
 
 
-def load_session_messages(session_id: str) -> list[dict[str, str]]:
+def load_session_messages(session_id: str) -> list[dict[str, object]]:
     records = list_chat_records(session_id=session_id, limit=200)
     return chat_records_to_messages(records)
 
@@ -130,20 +172,20 @@ def apply_compact_style() -> None:
         """
         <style>
         section[data-testid="stSidebar"] .status-card {
-            border: 1px solid rgba(160, 166, 180, 0.24);
+            border: 1px solid rgba(148, 163, 184, 0.32);
             border-radius: 8px;
             padding: 10px 12px;
             margin-bottom: 10px;
-            background: rgba(255, 255, 255, 0.04);
+            background: rgba(255, 255, 255, 0.72);
         }
         section[data-testid="stSidebar"] .status-label {
-            color: rgba(250, 250, 250, 0.68);
+            color: rgb(100, 116, 139);
             font-size: 0.78rem;
             line-height: 1.2;
             margin-bottom: 4px;
         }
         section[data-testid="stSidebar"] .status-value {
-            color: rgb(250, 250, 250);
+            color: rgb(15, 23, 42);
             font-size: 0.98rem;
             font-weight: 650;
             line-height: 1.35;
@@ -153,22 +195,33 @@ def apply_compact_style() -> None:
             white-space: pre-wrap;
             word-break: break-word;
         }
+        /* 让高级设置里的 LLM Provider 选项完整可见 */
+        section[data-testid="stSidebar"] [data-testid="stExpander"] [data-testid="stVerticalBlock"] {
+            flex: 1 1 100% !important;
+            width: 100% !important;
+        }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
 
-def render_sidebar(mode: str) -> None:
-    render_session_manager()
-    render_model_selector()
-    render_knowledge_manager()
+def render_mode_selector() -> str:
+    st.sidebar.header("模式")
+    return st.sidebar.radio(
+        "选择模式",
+        [MODE_AUTO, MODE_COURSE_QA, MODE_IMAGE, MODE_REPORT, MODE_CHAT],
+        captions=[MODE_DESCRIPTIONS[mode] for mode in [MODE_AUTO, MODE_COURSE_QA, MODE_IMAGE, MODE_REPORT, MODE_CHAT]],
+        key="mode_selector",
+        width="stretch",
+    )
 
-    st.sidebar.divider()
-    st.sidebar.header("功能")
-    st.sidebar.caption("V1 先跑通 RAG 主流程，其他模块快速逐步接入。")
-    if mode != MODE_COURSE_QA:
-        st.sidebar.info("知识库已独立管理，切换模式不会丢失已上传资料。")
+
+def render_sidebar() -> None:
+    with st.sidebar.expander("高级设置", icon=":material/tune:", expanded=True):
+        render_model_selector()
+    render_session_manager()
+    render_knowledge_manager()
 
 
 def clear_sidebar_selector_state(*keys: str) -> None:
@@ -177,29 +230,91 @@ def clear_sidebar_selector_state(*keys: str) -> None:
         st.session_state.pop(key, None)
 
 
+def delete_current_session() -> None:
+    delete_session(st.session_state.session_id)
+    remaining_sessions = list_sessions(limit=20)
+    next_session = (
+        remaining_sessions[0]
+        if remaining_sessions
+        else create_session(active_kb_id=st.session_state.active_kb_id)
+    )
+    st.session_state.session_id = next_session.session_id
+    st.session_state.messages = load_session_messages(next_session.session_id)
+    clear_sidebar_selector_state("session_selector")
+
+
+@st.dialog("删除当前会话")
+def confirm_delete_current_session_dialog() -> None:
+    st.warning("此操作会删除当前会话及其聊天记录，无法撤销。", icon=":material/warning:")
+    with st.container(horizontal=True, horizontal_alignment="right"):
+        if st.button("取消", key="cancel_delete_current_session"):
+            st.rerun()
+        if st.button(
+            "确认删除",
+            key="confirm_delete_current_session",
+            icon=":material/delete:",
+            type="primary",
+        ):
+            try:
+                delete_current_session()
+            except sqlite3.Error as exc:
+                st.error(format_database_error("删除会话", exc))
+            else:
+                st.rerun()
+
+
+@st.dialog("删除会话")
+def confirm_delete_session_dialog(session: ChatSession) -> None:
+    st.warning(f"将删除「{session.title}」及其中的聊天记录，无法撤销。", icon=":material/warning:")
+    with st.container(horizontal=True, horizontal_alignment="right"):
+        if st.button("取消", key=f"cancel_delete_session_{session.session_id}"):
+            st.rerun()
+        if st.button(
+            "确认删除",
+            key=f"confirm_delete_session_{session.session_id}",
+            icon=":material/delete:",
+            type="primary",
+        ):
+            try:
+                delete_session(session.session_id)
+                if session.session_id == st.session_state.get("session_id"):
+                    remaining_sessions = list_sessions(limit=20)
+                    next_session = (
+                        remaining_sessions[0]
+                        if remaining_sessions
+                        else create_session(active_kb_id=st.session_state.active_kb_id)
+                    )
+                    st.session_state.session_id = next_session.session_id
+                    st.session_state.messages = load_session_messages(next_session.session_id)
+            except sqlite3.Error as exc:
+                st.error(format_database_error("删除会话", exc))
+            else:
+                clear_sidebar_selector_state("session_selector")
+                st.rerun()
+
+
+@st.dialog("重命名会话")
+def rename_session_dialog(session: ChatSession) -> None:
+    new_title = st.text_input("会话名称", value=session.title, key=f"rename_session_{session.session_id}")
+    with st.container(horizontal=True, horizontal_alignment="right"):
+        if st.button("取消", key=f"cancel_rename_session_{session.session_id}"):
+            st.rerun()
+        if st.button("保存", key=f"save_rename_session_{session.session_id}", icon=":material/check:"):
+            try:
+                update_session_title(session.session_id, new_title)
+            except sqlite3.Error as exc:
+                st.error(format_database_error("重命名会话", exc))
+            else:
+                st.rerun()
+
+
 def render_session_manager() -> None:
     st.sidebar.header("会话")
     sessions = list_sessions(limit=20)
     if not sessions:
         sessions = [create_session(active_kb_id=st.session_state.active_kb_id)]
 
-    session_ids = [session.session_id for session in sessions]
     current_session_id = st.session_state.get("session_id")
-    index = session_ids.index(current_session_id) if current_session_id in session_ids else 0
-    selected_session_id = st.sidebar.selectbox(
-        "历史会话",
-        session_ids,
-        index=index,
-        format_func=lambda session_id: format_session_label(
-            next(session for session in sessions if session.session_id == session_id)
-        ),
-        key="session_selector",
-    )
-
-    if selected_session_id != current_session_id:
-        st.session_state.session_id = selected_session_id
-        st.session_state.messages = load_session_messages(selected_session_id)
-        st.rerun()
 
     if st.sidebar.button("新建会话", icon=":material/add:", width="stretch"):
         session = create_session(active_kb_id=st.session_state.active_kb_id)
@@ -208,40 +323,67 @@ def render_session_manager() -> None:
         clear_sidebar_selector_state("session_selector")
         st.rerun()
 
-    if st.sidebar.button("删除当前会话", icon=":material/delete:", width="stretch"):
-        delete_session(st.session_state.session_id)
-        remaining_sessions = list_sessions(limit=20)
-        next_session = (
-            remaining_sessions[0]
-            if remaining_sessions
-            else create_session(active_kb_id=st.session_state.active_kb_id)
-        )
-        st.session_state.session_id = next_session.session_id
-        st.session_state.messages = load_session_messages(next_session.session_id)
-        clear_sidebar_selector_state("session_selector")
-        st.rerun()
+    if st.sidebar.button(
+        "删除当前会话",
+        icon=":material/delete:",
+        width="stretch",
+    ):
+        confirm_delete_current_session_dialog()
+
+    st.sidebar.caption("历史会话")
+    with st.sidebar.container(height=260, border=True, gap="xsmall"):
+        for session in sessions:
+            is_current = session.session_id == current_session_id
+            cols = st.columns([7, 1, 1], vertical_alignment="center")
+            if cols[0].button(
+                format_session_label(session),
+                key=f"open_session_{session.session_id}",
+                width="stretch",
+                type="primary" if is_current else "secondary",
+            ):
+                if not is_current:
+                    st.session_state.session_id = session.session_id
+                    st.session_state.messages = load_session_messages(session.session_id)
+                    st.rerun()
+            if cols[1].button(
+                "",
+                icon=":material/edit:",
+                key=f"edit_session_{session.session_id}",
+                help="重命名会话",
+            ):
+                rename_session_dialog(session)
+            if cols[2].button(
+                "",
+                icon=":material/delete:",
+                key=f"delete_session_{session.session_id}",
+                help="删除会话",
+            ):
+                confirm_delete_session_dialog(session)
 
 
 def render_model_selector() -> None:
-    st.sidebar.divider()
-    st.sidebar.header("模型")
     provider_values = list(LLM_PROVIDER_OPTIONS.values())
     current = st.session_state.get("llm_provider_name", "auto")
     index = provider_values.index(current) if current in provider_values else 0
-    selected_label = st.sidebar.selectbox(
+    st.caption("选择回答问题所用的大模型来源。")
+    selected_label = st.radio(
         "LLM Provider",
         list(LLM_PROVIDER_OPTIONS.keys()),
         index=index,
-        help="自动：有 LLM_API_KEY 时调用云端兼容 API，否则使用本地 fallback。本地模型需要先启动 Ollama。",
+        help=(
+            "自动：优先云端模型，无 API Key 时用本地 Ollama，都不可用才离线兜底。\n"
+            "云端模型：需要 LLM_API_KEY。\n"
+            "本地 Ollama：需要先启动 Ollama 并拉取模型。\n"
+            "离线兜底：不调用任何大模型，仅返回检索片段，适合无网演示。"
+        ),
     )
     st.session_state.llm_provider_name = LLM_PROVIDER_OPTIONS[selected_label]
     if st.session_state.llm_provider_name == "ollama":
-        st.sidebar.caption("本地模型模式默认调用 Ollama 中配置的模型。")
+        st.caption("本地 Ollama 模式：请确认已运行 `ollama serve` 并拉取模型。")
     refresh_knowledge_status()
 
 
 def render_knowledge_manager() -> None:
-    st.sidebar.divider()
     st.sidebar.header("知识库")
     bases = list_knowledge_bases()
     active_kb = get_current_kb()
@@ -260,28 +402,27 @@ def render_knowledge_manager() -> None:
     if selected_kb_id != st.session_state.active_kb_id:
         switch_knowledge_base(selected_kb_id)
 
-    with st.sidebar.form("create_kb_form", border=False):
-        kb_name = st.text_input("新知识库名称", placeholder="例如：Dify 课程资料")
-        submitted = st.form_submit_button("新建知识库", icon=":material/create_new_folder:")
-    if submitted:
-        kb = create_knowledge_base(kb_name, is_active=True)
-        switch_knowledge_base(kb.kb_id)
-
-    if st.sidebar.button("删除当前知识库", icon=":material/delete:", width="stretch"):
-        delete_knowledge_base(st.session_state.active_kb_id)
-        next_kb = ensure_default_knowledge_base()
-        st.session_state.active_kb_id = next_kb.kb_id
-        update_session_active_kb(st.session_state.session_id, next_kb.kb_id)
-        clear_sidebar_selector_state("kb_selector")
-        refresh_knowledge_status()
-        st.rerun()
-
     active_kb = get_current_kb()
     files = list_knowledge_base_files(active_kb.kb_id)
     st.session_state.knowledge_status = knowledge_status_from_files(active_kb, files)
-    render_status_section(files)
-    render_upload_panel(active_kb, files)
-    render_file_management(active_kb, files)
+    with st.sidebar.expander("知识库管理", icon=":material/database:", expanded=False):
+        with st.form("create_kb_form", border=False):
+            kb_name = st.text_input("新知识库名称", placeholder="例如：Dify 课程资料")
+            submitted = st.form_submit_button("新建知识库", icon=":material/create_new_folder:")
+        if submitted:
+            kb = create_knowledge_base(kb_name, is_active=True)
+            switch_knowledge_base(kb.kb_id)
+
+        if st.button(
+            "删除当前知识库",
+            icon=":material/delete:",
+            width="stretch",
+        ):
+            confirm_delete_knowledge_base_dialog(active_kb)
+
+        render_status_section(files)
+        render_upload_panel(active_kb, files)
+        render_file_management(active_kb, files)
 
 
 def switch_knowledge_base(kb_id: str) -> None:
@@ -293,25 +434,79 @@ def switch_knowledge_base(kb_id: str) -> None:
     st.rerun()
 
 
+@st.dialog("删除当前知识库")
+def confirm_delete_knowledge_base_dialog(kb: KnowledgeBase) -> None:
+    st.warning(f"将删除知识库「{kb.name}」及其上传资料和索引文件，无法撤销。", icon=":material/warning:")
+    with st.container(horizontal=True, horizontal_alignment="right"):
+        if st.button("取消", key=f"cancel_delete_kb_{kb.kb_id}"):
+            st.rerun()
+        if st.button(
+            "确认删除",
+            key=f"confirm_delete_kb_{kb.kb_id}",
+            icon=":material/delete:",
+            type="primary",
+        ):
+            try:
+                delete_knowledge_base(kb.kb_id)
+                next_kb = ensure_default_knowledge_base()
+                update_session_active_kb(st.session_state.session_id, next_kb.kb_id)
+            except sqlite3.Error as exc:
+                st.error(format_database_error("删除知识库", exc))
+            except OSError as exc:
+                st.error(f"删除知识库失败：文件系统暂时不可写，请检查资料文件权限后重试。详情：{exc}")
+            else:
+                st.session_state.active_kb_id = next_kb.kb_id
+                clear_sidebar_selector_state("kb_selector")
+                refresh_knowledge_status()
+                st.rerun()
+
+
+@st.dialog("删除资料并重建")
+def confirm_delete_file_dialog(active_kb: KnowledgeBase, files: list[KnowledgeBaseFile], selected_file_id: int) -> None:
+    selected_file = next(file for file in files if file.id == selected_file_id)
+    st.warning(f"将删除「{selected_file.file_name}」并重建当前知识库索引，无法撤销。", icon=":material/warning:")
+    with st.container(horizontal=True, horizontal_alignment="right"):
+        if st.button("取消", key=f"cancel_delete_file_{selected_file_id}"):
+            st.rerun()
+        if st.button(
+            "确认删除",
+            key=f"confirm_delete_file_{selected_file_id}",
+            icon=":material/delete:",
+            type="primary",
+        ):
+            try:
+                delete_knowledge_base_file(selected_file_id)
+                remaining_files = [file for file in files if file.id != selected_file_id]
+                rebuild_knowledge_base(active_kb, remaining_files)
+            except sqlite3.Error as exc:
+                st.error(format_database_error("删除资料", exc))
+            except OSError as exc:
+                st.error(f"删除资料失败：文件系统暂时不可写，请检查资料文件权限后重试。详情：{exc}")
+            else:
+                refresh_knowledge_status()
+                st.success("已删除所选资料并更新索引。")
+                st.rerun()
+
+
 def render_status_section(files: list[KnowledgeBaseFile]) -> None:
     status = st.session_state.knowledge_status
     status_label = "已建库" if status["status"] == "ready" else "未建库"
 
-    st.sidebar.subheader("RAG 状态")
+    st.subheader("RAG 状态")
     render_status_card("知识库", status_label)
     render_status_card("资料", _shorten(status["source_name"], max_length=18))
     render_status_card("切分片段", status["chunk_count"])
     render_status_card("LLM Provider", status["provider"])
 
     if files:
-        with st.sidebar.expander("查看资料列表", expanded=False):
+        with st.expander("查看资料列表", expanded=False):
             for file in files:
                 st.caption(f"{file.created_at.strftime('%H:%M')} · {file.status} · {file.chunk_count} 片段")
                 st.write(_shorten(file.file_name, 30))
 
 
 def render_upload_panel(active_kb: KnowledgeBase, files: list[KnowledgeBaseFile]) -> None:
-    uploaded_file = st.sidebar.file_uploader(
+    uploaded_file = st.file_uploader(
         "上传资料到当前知识库",
         type=SUPPORTED_DOC_TYPES,
         key=f"kb_upload_{active_kb.kb_id}",
@@ -326,11 +521,11 @@ def render_upload_panel(active_kb: KnowledgeBase, files: list[KnowledgeBaseFile]
     try:
         build_info = index_uploaded_file(active_kb, uploaded_file, append=bool(files))
     except DocumentLoadError as exc:
-        st.sidebar.error(f"资料解析失败：{exc}")
+        st.error(f"资料解析失败：{exc}")
         return
 
     st.session_state.last_indexed_upload = upload_fingerprint
-    st.sidebar.success(f"已索引 {build_info['source_name']}，新增 {build_info['chunk_count']} 个片段。")
+    st.success(f"已索引 {build_info['source_name']}，新增 {build_info['chunk_count']} 个片段。")
     refresh_knowledge_status()
     st.rerun()
 
@@ -358,7 +553,7 @@ def render_file_management(active_kb: KnowledgeBase, files: list[KnowledgeBaseFi
     if not files:
         return
 
-    with st.sidebar.expander("管理资料", expanded=False):
+    with st.expander("管理资料", expanded=False):
         if st.button("重新建库", icon=":material/refresh:", width="stretch"):
             try:
                 chunk_count = rebuild_knowledge_base(active_kb, files)
@@ -376,13 +571,12 @@ def render_file_management(active_kb: KnowledgeBase, files: list[KnowledgeBaseFi
             format_func=lambda file_id: next(file.file_name for file in files if file.id == file_id),
             key=f"delete_file_{active_kb.kb_id}",
         )
-        if st.button("删除所选资料并重建", icon=":material/delete:", width="stretch"):
-            delete_knowledge_base_file(selected_file_id)
-            remaining_files = [file for file in files if file.id != selected_file_id]
-            rebuild_knowledge_base(active_kb, remaining_files)
-            refresh_knowledge_status()
-            st.success("已删除所选资料并更新索引。")
-            st.rerun()
+        if st.button(
+            "删除所选资料并重建",
+            icon=":material/delete:",
+            width="stretch",
+        ):
+            confirm_delete_file_dialog(active_kb, files, selected_file_id)
 
 
 def rebuild_knowledge_base(
@@ -407,7 +601,7 @@ def rebuild_knowledge_base(
 
 
 def render_status_card(label: str, value: str) -> None:
-    st.sidebar.markdown(
+    st.markdown(
         f"""
         <div class="status-card">
             <div class="status-label">{escape(label)}</div>
@@ -433,6 +627,13 @@ def _file_type(path: Path) -> str:
     return path.suffix.lower().lstrip(".") or "unknown"
 
 
+def format_database_error(action: str, exc: sqlite3.Error) -> str:
+    detail = str(exc)
+    if "readonly" in detail.lower():
+        return f"{action}失败：数据库暂时不可写，请关闭占用该数据库的程序或检查文件权限后重试。"
+    return f"{action}失败：数据库操作未完成。详情：{detail}"
+
+
 # Report generation can also return a ready knowledge status, so sidebar refreshes
 # must require indexing-specific fields instead of trusting one shared flag.
 def is_knowledge_base_build_result(result: dict[str, object]) -> bool:
@@ -451,10 +652,10 @@ def get_report_knowledge_notice(
         return "success", f"本次报告参考了 {len(sources)} 个知识库片段。"
     return "warning", "本次报告未使用知识库资料，当前结果为通用草稿。"
 
-def render_workflow_steps(steps: list[dict[str, object]], title: str = "Agent 工作流") -> None:
+def render_workflow_steps(steps: list[dict[str, object]], title: str = "查看推理过程") -> None:
     if not steps:
         return
-    with st.expander(title):
+    with st.expander(title, icon=":material/account_tree:"):
         for index, step in enumerate(steps, start=1):
             step_title = str(step.get("title", f"步骤 {index}"))
             detail = str(step.get("detail", ""))
@@ -466,7 +667,7 @@ def render_workflow_steps(steps: list[dict[str, object]], title: str = "Agent �
 def render_sources(sources: list[dict[str, object]], title: str = "查看引用来源") -> None:
     if not sources:
         return
-    with st.expander(title):
+    with st.expander(f"{title} · {len(sources)} 篇引用", icon=":material/article:"):
         for source in sources:
             source_name = str(source.get("source_name", "未知资料"))
             chunk_id = str(source.get("chunk_id", "?"))
@@ -500,12 +701,18 @@ def update_knowledge_status(result: dict[str, object]) -> None:
 
 
 def render_chat_history() -> None:
-    for message in st.session_state.messages:
+    for index, message in enumerate(st.session_state.messages):
+        if is_system_notice_message(message):
+            st.warning(str(message["content"]), icon=":material/warning:")
+            continue
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
             if message.get("image_path"):
                 st.image(message["image_path"], caption="检测结果")
-            render_workflow_steps(message.get("workflow_steps", []))
+            if message.get("sources"):
+                st.caption(f":material/article: {len(message.get('sources', []))} 篇引用")
+            if should_show_workflow_steps(message):
+                render_workflow_steps(message.get("workflow_steps", []))
             if message.get("download_name"):
                 render_report_sources(
                     message.get("knowledge_status"),
@@ -514,6 +721,65 @@ def render_chat_history() -> None:
                 render_report_download(message["content"], message["download_name"])
             elif message.get("sources"):
                 render_sources(message.get("sources", []))
+            if message["role"] == "assistant":
+                render_regenerate_button(index)
+
+
+def is_system_notice_message(message: dict[str, object]) -> bool:
+    return message.get("role") == "assistant" and str(message.get("content", "")) == NO_RETRIEVAL_NOTICE
+
+
+def should_show_workflow_steps(message: dict[str, object]) -> bool:
+    steps = message.get("workflow_steps", [])
+    if not steps:
+        return False
+    first_detail = str(steps[0].get("detail", "")) if isinstance(steps, list) and steps else ""
+    return "自动识别" in first_detail
+
+
+def render_regenerate_button(message_index: int) -> None:
+    previous_question = ""
+    for message in reversed(st.session_state.messages[:message_index]):
+        if message.get("role") == "user":
+            previous_question = str(message.get("content", ""))
+            break
+    if not previous_question:
+        return
+    if st.button(
+        "",
+        icon=":material/refresh:",
+        key=f"regenerate_{message_index}",
+        help="重新生成",
+    ):
+        st.session_state.pending_question = previous_question
+        st.rerun()
+
+
+def select_mode(mode: str) -> None:
+    st.session_state.mode_selector = mode
+
+
+def render_empty_state() -> None:
+    if st.session_state.messages:
+        return
+    st.subheader("从一个任务开始")
+    cards = st.columns(3)
+    card_specs = [
+        (MODE_COURSE_QA, "课程问答", "上传课程资料后，提问并查看引用来源。", ":material/article:"),
+        (MODE_IMAGE, "图片检测", "上传图片，识别图中的关键目标。", ":material/image_search:"),
+        (MODE_REPORT, "复习提纲生成", "把章节内容整理成提纲、练习题或报告。", ":material/edit_note:"),
+    ]
+    for column, (mode, title, body, icon) in zip(cards, card_specs, strict=False):
+        with column.container(border=True, height=160):
+            st.markdown(f"{icon} **{title}**")
+            st.caption(body)
+            st.button(
+                "进入",
+                key=f"empty_state_{mode}",
+                icon=":material/arrow_forward:",
+                on_click=select_mode,
+                args=(mode,),
+            )
 
 
 def render_report_download(content: str, download_name: str) -> None:
@@ -532,15 +798,12 @@ def main() -> None:
     apply_compact_style()
 
     st.title("AI 多模态学习助手")
+    st.caption("上传课程资料 → 提问 → 获取带引用的答案。试试问我：生成 CPU 章节的复习提纲。")
 
-    mode = st.sidebar.radio(
-        "选择模式",
-        [MODE_AUTO, MODE_COURSE_QA, MODE_IMAGE, MODE_REPORT, MODE_CHAT],
-    )
-    render_sidebar(mode)
+    mode = render_mode_selector()
+    render_sidebar()
 
     active_kb = get_current_kb()
-    st.info("资料上传已移到侧边栏知识库区域；模型可在侧边栏切换，没有 API Key 时会自动 fallback。")
 
     uploaded_image = None
     confidence_threshold = YOLO_CONFIDENCE_THRESHOLD
@@ -580,11 +843,24 @@ def main() -> None:
         else:
             st.info(f"{learning_type} 会使用专用 Prompt，并尽量结合当前知识库资料。")
 
+    render_empty_state()
     render_chat_history()
 
-    question = st.chat_input("请输入你的问题", submit_mode="disable")
+    notice_slot = st.empty()
+    if st.session_state.get("system_notice"):
+        notice_slot.warning(st.session_state.system_notice, icon=":material/warning:")
+
+    st.caption(f"最多 {CHAT_INPUT_LIMIT} 字，Enter 发送，Shift+Enter 换行。")
+    question = st.chat_input(
+        CHAT_PLACEHOLDERS.get(mode, "请输入你的问题…"),
+        key="chat_input",
+        max_chars=CHAT_INPUT_LIMIT,
+        submit_mode="stop",
+    )
+    question = question or st.session_state.pop("pending_question", "")
     if question:
         maybe_update_session_title(st.session_state.session_id, question)
+        conversation_history = build_conversation_history(st.session_state.messages)
         st.session_state.messages.append({"role": "user", "content": question})
         with st.chat_message("user"):
             st.write(question)
@@ -603,9 +879,15 @@ def main() -> None:
                 session_id=st.session_state.session_id,
                 has_knowledge_base=st.session_state.knowledge_status["status"] == "ready",
                 llm_provider_name=st.session_state.llm_provider_name,
+                conversation_history=conversation_history,
             )
 
         update_knowledge_status(result)
+        if result.get("system_notice"):
+            st.session_state.system_notice = str(result["system_notice"])
+            notice_slot.warning(st.session_state.system_notice, icon=":material/warning:")
+            return
+        st.session_state.system_notice = ""
         provider = result.get("provider", "fallback")
         resolved_mode = result.get("resolved_mode")
         answer = result["answer"]
@@ -628,7 +910,10 @@ def main() -> None:
             st.markdown(answer)
             if assistant_message.get("image_path"):
                 st.image(assistant_message["image_path"], caption="检测结果")
-            render_workflow_steps(assistant_message.get("workflow_steps", []))
+            if assistant_message.get("sources"):
+                st.caption(f":material/article: {len(assistant_message.get('sources', []))} 篇引用")
+            if should_show_workflow_steps(assistant_message):
+                render_workflow_steps(assistant_message.get("workflow_steps", []))
             if assistant_message.get("download_name"):
                 render_report_sources(
                     assistant_message.get("knowledge_status"),

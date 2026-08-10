@@ -1,5 +1,7 @@
 import tempfile
 import unittest
+import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 
@@ -125,6 +127,50 @@ class KnowledgeBaseManagementTests(unittest.TestCase):
             self.assertEqual([kb.kb_id for kb in bases], [original.kb_id])
             self.assertEqual(active.kb_id, original.kb_id)
             self.assertEqual(list_knowledge_base_files(target.kb_id, db_path=db_path), [])
+
+    def test_delete_knowledge_base_removes_uploaded_files_and_vector_store(self):
+        from modules.database.knowledge import (
+            create_knowledge_base,
+            delete_knowledge_base,
+            ensure_default_knowledge_base,
+            save_knowledge_base_file,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            db_path = tmp_path / "app.db"
+            ensure_default_knowledge_base(db_path=db_path)
+            target = create_knowledge_base("kb with files", db_path=db_path, is_active=True)
+            upload_dir = tmp_path / "uploads" / target.kb_id
+            upload_dir.mkdir(parents=True)
+            uploaded_file = upload_dir / "rag.md"
+            uploaded_file.write_text("course material", encoding="utf-8")
+            store_path = tmp_path / "vector_db" / target.kb_id / "rag_store.json"
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.execute(
+                    "UPDATE knowledge_bases SET store_path = ? WHERE kb_id = ?",
+                    (str(store_path), target.kb_id),
+                )
+                conn.commit()
+            store_path.parent.mkdir(parents=True, exist_ok=True)
+            store_path.write_text("[]", encoding="utf-8")
+            save_knowledge_base_file(
+                kb_id=target.kb_id,
+                file_name=uploaded_file.name,
+                file_type="md",
+                storage_path=uploaded_file,
+                chunk_count=1,
+                status="indexed",
+                db_path=db_path,
+            )
+
+            deleted = delete_knowledge_base(target.kb_id, db_path=db_path)
+
+            self.assertTrue(deleted)
+            self.assertFalse(uploaded_file.exists())
+            self.assertFalse(upload_dir.exists())
+            self.assertFalse(store_path.exists())
+            self.assertFalse(store_path.parent.exists())
 
 
 if __name__ == "__main__":

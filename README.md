@@ -7,7 +7,7 @@
 - 课程资料问答：上传 PDF、TXT、Markdown、PPTX 后构建本地知识库，并基于检索片段回答问题。
 - 引用来源展示：回答和报告会显示资料来源、片段编号和相关度，便于追溯依据。
 - Agent 自动路由：根据用户输入和当前模式识别意图，自动调用 RAG、LLM、YOLO 或报告生成流程。
-- 工作流可视化：每次回答下方展示“识别意图 → 调用工具 → 返回结果”的执行过程。
+- 推理过程展示：自动路由回答下方可展开查看“识别意图 → 调用工具 → 返回结果”的执行过程。
 - 图片目标检测：上传图片后调用 YOLOv8 进行检测，并可结合 LLM 生成自然语言分析。
 - 学习辅助生成：生成课程总结、复习提纲、报告大纲或实验报告，并支持 Markdown 下载。
 - 知识库与会话管理：支持多个知识库、多个会话、历史消息恢复和资料管理。
@@ -94,8 +94,8 @@ LLM_MODEL_NAME=你的模型名称
 
 - `LLM_PROVIDER=auto`：优先使用 `LLM_API_KEY` 配置的云端兼容 API；没有 Key 时自动进入本地 fallback。
 - `LLM_PROVIDER=cloud`：只尝试使用云端兼容 API；没有 `LLM_API_KEY` 时 fallback。
-- `LLM_PROVIDER=fallback`：不调用外部大模型，只返回本地检索片段，适合无网络答辩演示。
-- `LLM_PROVIDER=ollama`：调用本地 Ollama，默认地址为 `http://localhost:11434`，默认模型为 `qwen2.5:3b`。
+- `LLM_PROVIDER=fallback`：不调用外部大模型；简单闲聊和算术会给出本地友好回复，RAG 问答会返回检索到的课程片段，适合无网络答辩演示。
+- `LLM_PROVIDER=ollama`：显式调用本地 Ollama，默认地址为 `http://localhost:11434`，默认模型为 `qwen2.5:7b`。
 - 兼容旧配置：也可以使用 `DASHSCOPE_API_KEY` 或 `DEEPSEEK_API_KEY`。
 
 如果使用 OpenAI 兼容服务，通常需要同时配置 `LLM_API_KEY`、`LLM_BASE_URL` 和 `LLM_MODEL_NAME`。如果服务商使用默认 OpenAI 地址，可以不填 `LLM_BASE_URL`。
@@ -117,18 +117,17 @@ http://localhost:8501
 1. 在侧边栏新建或选择知识库。
 2. 上传课程 PDF / TXT / Markdown / PPTX，等待索引完成。
 3. 选择“自动识别”或“课程资料问答”，输入课程相关问题。
-4. 展开回答下方的“Agent 工作流”和“查看引用来源”。
+4. 展开回答下方的“查看推理过程”和“查看引用来源”。
 5. 切换到“学习辅助生成”，生成课程总结或实验报告并下载 Markdown。
 6. 切换到“图片目标检测”，上传图片并查看 YOLO 检测结果。
 
 ## 运行测试
 
-测试统一使用 `LLM_PROVIDER=fallback`，避免因本地配置了 API Key 导致测试触网失败：
+测试入口会跳过 `.env` 加载，并在测试包中固定 provider 环境，避免因本机配置了 API Key 或 Ollama 导致测试触网失败：
 
 ```powershell
 cd AI-Learning-Assistant
 $env:PYTHONPATH='.'
-$env:LLM_PROVIDER='fallback'
 python -m unittest discover -s tests -v
 ```
 
@@ -136,6 +135,25 @@ python -m unittest discover -s tests -v
 
 ```powershell
 $env:PYTHONPATH='.'; python -m unittest tests.test_route_knowledge_base -v
+```
+
+## 交付验收用例
+
+建议答辩或交付前在默认“自动识别”模式下按顺序验证：
+
+| 输入 | 期望结果 |
+|---|---|
+| `你好` | 走普通问答，返回友好回复，不出现“未检索到相关片段”。 |
+| `你是谁` | 走普通问答，说明助手能力，不误走 RAG。 |
+| `1+1等于几` | 走普通问答，返回基础计算结果。 |
+| `解释 CPU 指令周期` | 走课程资料问答，回答带引用来源。 |
+| `解释量子纠缠` | 若课程资料未覆盖，走 LLM 通用回答，并标注“未在课程资料中检索到相关内容，以下为通用回答”。 |
+
+交付前命令：
+
+```powershell
+python -m unittest discover tests
+streamlit run app.py --server.port 8501
 ```
 
 ## 常见问题

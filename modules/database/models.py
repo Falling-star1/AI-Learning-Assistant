@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -11,6 +12,7 @@ class ChatRecord:
     mode: str
     provider: str
     created_at: datetime
+    metadata: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)

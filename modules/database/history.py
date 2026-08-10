@@ -1,7 +1,9 @@
+import json
 import sqlite3
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from config import DATABASE_PATH
 from modules.database.models import ChatRecord
@@ -20,6 +22,7 @@ def init_db(db_path: str | Path = DATABASE_PATH) -> Path:
                 content TEXT NOT NULL,
                 mode TEXT NOT NULL,
                 provider TEXT NOT NULL,
+                metadata_json TEXT,
                 created_at TEXT NOT NULL
             )
             """
@@ -37,18 +40,21 @@ def save_chat_record(
     content: str,
     mode: str,
     provider: str,
+    metadata: dict[str, Any] | None = None,
     db_path: str | Path = DATABASE_PATH,
 ) -> int:
     """Save one chat message; callers save user and assistant separately."""
     init_db(db_path)
     created_at = datetime.now().isoformat(timespec="seconds")
+    metadata_json = json.dumps(metadata, ensure_ascii=False) if metadata else None
     with closing(sqlite3.connect(db_path)) as conn:
+        _ensure_metadata_column(conn)
         cursor = conn.execute(
             """
-            INSERT INTO chat_history(session_id, role, content, mode, provider, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO chat_history(session_id, role, content, mode, provider, metadata_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (session_id, role, content, mode, provider, created_at),
+            (session_id, role, content, mode, provider, metadata_json, created_at),
         )
         record_id = int(cursor.lastrowid)
         conn.commit()
@@ -72,11 +78,20 @@ def list_chat_records(
     db_path: str | Path = DATABASE_PATH,
     limit: int = 20,
 ) -> list[ChatRecord]:
-    init_db(db_path)
+    path = Path(db_path)
+    if not path.exists():
+        return []
+
+    with closing(sqlite3.connect(db_path)) as conn:
+        if not _has_table(conn, "chat_history"):
+            return []
+        has_metadata = _has_column(conn, "metadata_json")
+
     params: tuple[object, ...]
+    metadata_expr = "metadata_json" if has_metadata else "NULL AS metadata_json"
     if session_id:
-        sql = """
-            SELECT id, session_id, role, content, mode, provider, created_at
+        sql = f"""
+            SELECT id, session_id, role, content, mode, provider, {metadata_expr}, created_at
             FROM chat_history
             WHERE session_id = ?
             ORDER BY id DESC
@@ -84,8 +99,8 @@ def list_chat_records(
         """
         params = (session_id, limit)
     else:
-        sql = """
-            SELECT id, session_id, role, content, mode, provider, created_at
+        sql = f"""
+            SELECT id, session_id, role, content, mode, provider, {metadata_expr}, created_at
             FROM chat_history
             ORDER BY id DESC
             LIMIT ?
@@ -99,7 +114,26 @@ def list_chat_records(
     return [_row_to_record(row) for row in rows]
 
 
+def _ensure_metadata_column(conn: sqlite3.Connection) -> None:
+    if not _has_column(conn, "metadata_json"):
+        conn.execute("ALTER TABLE chat_history ADD COLUMN metadata_json TEXT")
+
+
+def _has_column(conn: sqlite3.Connection, column_name: str) -> bool:
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(chat_history)").fetchall()}
+    return column_name in columns
+
+
+def _has_table(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
 def _row_to_record(row: tuple[object, ...]) -> ChatRecord:
+    metadata = json.loads(str(row[6])) if row[6] else None
     return ChatRecord(
         id=int(row[0]),
         session_id=str(row[1]),
@@ -107,5 +141,6 @@ def _row_to_record(row: tuple[object, ...]) -> ChatRecord:
         content=str(row[3]),
         mode=str(row[4]),
         provider=str(row[5]),
-        created_at=datetime.fromisoformat(str(row[6])),
+        metadata=metadata,
+        created_at=datetime.fromisoformat(str(row[7])),
     )

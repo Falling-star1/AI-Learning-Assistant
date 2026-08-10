@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
@@ -36,6 +37,7 @@ class LLMProvider(Protocol):
         self,
         prompt: str,
         context_chunks: Sequence[str] | None = None,
+        conversation_history: Sequence[dict[str, str]] | None = None,
     ) -> LLMResult:
         """Generate an answer from the selected provider."""
 
@@ -49,14 +51,11 @@ class FallbackLLMProvider:
         self,
         prompt: str,
         context_chunks: Sequence[str] | None = None,
+        conversation_history: Sequence[dict[str, str]] | None = None,
     ) -> LLMResult:
         chunks = [chunk.strip() for chunk in (context_chunks or []) if chunk.strip()]
         if not chunks:
-            text = (
-                "未检测到可用的大模型 API Key，当前处于本地 fallback 模式。\n\n"
-                f"用户问题：{prompt}\n\n"
-                "暂未检索到可引用的课程资料片段。"
-            )
+            text = _fallback_plain_answer(prompt, conversation_history)
         else:
             references = "\n\n".join(
                 f"**引用片段 {index}**\n\n```text\n{_escape_code_fence(chunk)}\n```"
@@ -89,8 +88,9 @@ class QwenLLMProvider:
         self,
         prompt: str,
         context_chunks: Sequence[str] | None = None,
+        conversation_history: Sequence[dict[str, str]] | None = None,
     ) -> LLMResult:
-        messages = _build_chat_messages(prompt, context_chunks)
+        messages = _build_chat_messages(prompt, context_chunks, conversation_history=conversation_history)
         response = self.client(api_key=self.api_key, model=self.model_name, messages=messages)
         return LLMResult(text=self._extract_text(response), provider=self.provider_name, used_remote_model=True)
 
@@ -137,23 +137,33 @@ class CloudLLMProvider:
         self,
         prompt: str,
         context_chunks: Sequence[str] | None = None,
+        conversation_history: Sequence[dict[str, str]] | None = None,
     ) -> LLMResult:
         client = self.client or self._default_client()
         try:
             response = client.chat.completions.create(
                 model=self.model_name,
-                messages=_build_chat_messages(prompt, context_chunks, system_prompt=self._system_prompt()),
+                messages=_build_chat_messages(
+                    prompt,
+                    context_chunks,
+                    system_prompt=self._system_prompt(),
+                    conversation_history=conversation_history,
+                ),
                 stream=False,
             )
         except _NETWORK_ERRORS as exc:
-            get_logger().warning(
+            _log_provider_warning(
                 "Cloud LLM 网络异常，降级到 fallback：provider=%s model=%s error=%s",
                 self.provider_name,
                 self.model_name,
                 exc,
             )
             fallback = FallbackLLMProvider()
-            result = fallback.generate(prompt=prompt, context_chunks=context_chunks)
+            result = fallback.generate(
+                prompt=prompt,
+                context_chunks=context_chunks,
+                conversation_history=conversation_history,
+            )
             return LLMResult(
                 text=f"⚠️ 云端模型调用失败（{type(exc).__name__}），已降级到本地 fallback 模式。\n\n{result.text}",
                 provider="fallback",
@@ -218,8 +228,13 @@ class OllamaLLMProvider:
         self,
         prompt: str,
         context_chunks: Sequence[str] | None = None,
+        conversation_history: Sequence[dict[str, str]] | None = None,
     ) -> LLMResult:
-        payload = {"model": self.model_name, "prompt": _build_user_message(prompt, context_chunks), "stream": False}
+        payload = {
+            "model": self.model_name,
+            "prompt": _build_ollama_prompt(prompt, context_chunks, conversation_history),
+            "stream": False,
+        }
         response = self.client(f"{self.base_url}/api/generate", payload)
         text = str(response.get("response", "")).strip()
         if not text:
@@ -281,11 +296,43 @@ def _build_chat_messages(
     prompt: str,
     context_chunks: Sequence[str] | None,
     system_prompt: str | None = None,
+    conversation_history: Sequence[dict[str, str]] | None = None,
 ) -> list[dict[str, str]]:
-    return [
+    messages = [
         {"role": "system", "content": system_prompt or "你是 AI 多模态学习助手，请优先依据用户提供的课程资料回答。"},
-        {"role": "user", "content": _build_user_message(prompt, context_chunks)},
     ]
+    messages.extend(_normalize_conversation_history(conversation_history))
+    messages.append({"role": "user", "content": _build_user_message(prompt, context_chunks)})
+    return messages
+
+
+def _normalize_conversation_history(
+    conversation_history: Sequence[dict[str, str]] | None,
+) -> list[dict[str, str]]:
+    normalized = []
+    for message in conversation_history or []:
+        role = message.get("role")
+        content = str(message.get("content", "")).strip()
+        if role not in {"user", "assistant"} or not content:
+            continue
+        normalized.append({"role": role, "content": content})
+    return normalized[-8:]
+
+
+def _build_ollama_prompt(
+    prompt: str,
+    context_chunks: Sequence[str] | None,
+    conversation_history: Sequence[dict[str, str]] | None,
+) -> str:
+    history = _normalize_conversation_history(conversation_history)
+    user_message = _build_user_message(prompt, context_chunks)
+    if not history:
+        return user_message
+    history_text = "\n".join(
+        f"{'用户' if message['role'] == 'user' else '助手'}：{message['content']}"
+        for message in history
+    )
+    return f"历史对话：\n{history_text}\n\n当前问题：\n{user_message}"
 
 
 def _build_user_message(prompt: str, context_chunks: Sequence[str] | None) -> str:
@@ -296,7 +343,71 @@ def _build_user_message(prompt: str, context_chunks: Sequence[str] | None) -> st
     return f"课程资料：\n{context}\n\n用户问题：\n{prompt}"
 
 
+def _fallback_plain_answer(
+    prompt: str,
+    conversation_history: Sequence[dict[str, str]] | None = None,
+) -> str:
+    text = prompt.strip()
+    lowered = text.lower()
+    if any(keyword in lowered for keyword in ("你好", "您好", "hello", "hi")):
+        return "你好，我是 AI 多模态学习助手。你可以上传课程资料后向我提问，也可以让我生成复习提纲、练习题或报告。"
+    if "你是谁" in lowered or "你是什么" in lowered:
+        return "我是 AI 多模态学习助手，主要帮助你围绕课程资料问答、图片目标检测和学习材料生成来完成学习任务。"
+
+    math_answer = _answer_simple_math(text)
+    if math_answer is not None:
+        return math_answer
+
+    history = _normalize_conversation_history(conversation_history)
+    if history:
+        history_text = "\n".join(
+            f"- {'用户' if message['role'] == 'user' else '助手'}：{message['content']}"
+            for message in history[-4:]
+        )
+        return (
+            "当前处于本地 fallback 模式，无法调用云端大模型继续生成完整回答。\n\n"
+            f"最近上下文：\n{history_text}\n\n"
+            f"当前问题：{prompt}\n\n"
+            "上下文已传入生成链路；配置可用的大模型后，可基于这些历史继续自然追问。"
+        )
+
+    return (
+        "当前处于本地 fallback 模式。\n\n"
+        f"用户问题：{prompt}\n\n"
+        "暂未检索到可引用的课程资料片段。"
+    )
+
+
+def _answer_simple_math(text: str) -> str | None:
+    compact = re.sub(r"\s+", "", text)
+    match = re.fullmatch(r"(-?\d+)([+\-*/×÷]|加|减|乘|除)(-?\d+)(?:=|＝|等于几|等于多少|多少)?", compact)
+    if not match:
+        return None
+
+    left = int(match.group(1))
+    operator = match.group(2)
+    right = int(match.group(3))
+    if operator in {"+", "加"}:
+        value = left + right
+    elif operator in {"-", "减"}:
+        value = left - right
+    elif operator in {"*", "×", "乘"}:
+        value = left * right
+    elif right == 0:
+        return "除数不能为 0。"
+    else:
+        value = left / right
+    return f"{left}{operator}{right} = {value:g}。"
+
+
 def _escape_code_fence(text: str) -> str:
     # Retrieved course notes may contain Markdown headings; code fences keep
     # fallback evidence readable instead of turning references into giant titles.
     return text.replace("```", "` ` `")
+
+
+def _log_provider_warning(message: str, *args: object) -> None:
+    try:
+        get_logger().warning(message, *args)
+    except OSError:
+        return

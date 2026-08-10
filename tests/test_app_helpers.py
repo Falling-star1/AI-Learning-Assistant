@@ -24,6 +24,27 @@ class AppHelperTests(unittest.TestCase):
             ],
         )
 
+    def test_build_conversation_history_keeps_recent_text_turns_only(self):
+        from app import build_conversation_history
+
+        messages = [
+            {"role": "assistant", "content": "旧回答"},
+            {"role": "tool", "content": "不应进入上下文"},
+            {"role": "user", "content": "CPU 是什么？"},
+            {"role": "assistant", "content": "CPU 是中央处理器。", "sources": [{"source_name": "cpu.md"}]},
+            {"role": "assistant", "content": ""},
+        ]
+
+        history = build_conversation_history(messages, limit=2)
+
+        self.assertEqual(
+            history,
+            [
+                {"role": "user", "content": "CPU 是什么？"},
+                {"role": "assistant", "content": "CPU 是中央处理器。"},
+            ],
+        )
+
     def test_knowledge_status_from_files_counts_indexed_chunks(self):
         from app import knowledge_status_from_files
 
@@ -47,6 +68,16 @@ class AppHelperTests(unittest.TestCase):
         session = ChatSession("session_1", "解释 YOLO", "kb_1", updated_at, updated_at)
 
         self.assertEqual(format_session_label(session), "09:30 · 解释 YOLO")
+
+    def test_format_database_error_for_readonly_database(self):
+        import sqlite3
+
+        from app import format_database_error
+
+        message = format_database_error("删除资料", sqlite3.OperationalError("attempt to write a readonly database"))
+
+        self.assertIn("删除资料失败", message)
+        self.assertIn("数据库暂时不可写", message)
 
 
 if __name__ == "__main__":
