@@ -78,8 +78,9 @@ def chat_records_to_messages(records: list[ChatRecord]) -> list[dict[str, object
     messages = []
     for record in records:
         message = {"role": record.role, "content": record.content}
-        if record.metadata:
-            message.update(record.metadata)
+        metadata = getattr(record, "metadata", None)
+        if metadata:
+            message.update(metadata)
         messages.append(message)
     return messages
 

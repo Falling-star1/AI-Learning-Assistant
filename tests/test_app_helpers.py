@@ -24,6 +24,17 @@ class AppHelperTests(unittest.TestCase):
             ],
         )
 
+    def test_chat_records_to_messages_tolerates_legacy_records_without_metadata(self):
+        from app import chat_records_to_messages
+
+        class LegacyChatRecord:
+            role = "assistant"
+            content = "旧记录"
+
+        messages = chat_records_to_messages([LegacyChatRecord()])
+
+        self.assertEqual(messages, [{"role": "assistant", "content": "旧记录"}])
+
     def test_build_conversation_history_keeps_recent_text_turns_only(self):
         from app import build_conversation_history
 
