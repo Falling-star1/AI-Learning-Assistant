@@ -145,6 +145,63 @@ class LLMProviderTests(unittest.TestCase):
         self.assertEqual(messages[2]["content"], "CPU 是中央处理器。")
         self.assertEqual(messages[3]["content"], "那它的作用是什么？")
 
+    def test_ollama_provider_uses_chat_api_with_conversation_history(self):
+        from modules.llm.provider import OllamaLLMProvider
+
+        calls = []
+
+        def fake_client(url, payload):
+            calls.append({"url": url, "payload": payload})
+            return {"message": {"content": "CPU 负责解释和执行指令。"}}
+
+        provider = OllamaLLMProvider(
+            model_name="qwen2.5:3b",
+            base_url="http://localhost:11434",
+            client=fake_client,
+        )
+        result = provider.generate(
+            "那它有什么作用？",
+            conversation_history=[
+                {"role": "user", "content": "CPU 是什么？"},
+                {"role": "assistant", "content": "CPU 是中央处理器。"},
+            ],
+        )
+
+        self.assertEqual(result.text, "CPU 负责解释和执行指令。")
+        self.assertEqual(calls[0]["url"], "http://localhost:11434/api/chat")
+        self.assertEqual(calls[0]["payload"]["model"], "qwen2.5:3b")
+        self.assertFalse(calls[0]["payload"]["stream"])
+        self.assertNotIn("prompt", calls[0]["payload"])
+        self.assertEqual(
+            [message["role"] for message in calls[0]["payload"]["messages"]],
+            ["system", "user", "assistant", "user"],
+        )
+        self.assertEqual(calls[0]["payload"]["messages"][1]["content"], "CPU 是什么？")
+        self.assertEqual(calls[0]["payload"]["messages"][2]["content"], "CPU 是中央处理器。")
+        self.assertEqual(calls[0]["payload"]["messages"][3]["content"], "那它有什么作用？")
+
+    def test_ollama_provider_wraps_rag_context_in_current_user_message(self):
+        from modules.llm.provider import OllamaLLMProvider
+
+        calls = []
+
+        def fake_client(url, payload):
+            calls.append(payload)
+            return {"message": {"content": "RAG 会先检索资料。"}}
+
+        provider = OllamaLLMProvider(client=fake_client)
+        provider.generate(
+            "解释 RAG",
+            context_chunks=["RAG 是检索增强生成。"],
+            conversation_history=[{"role": "user", "content": "继续讲课程内容"}],
+        )
+
+        user_message = calls[0]["messages"][-1]["content"]
+        self.assertIn("课程资料", user_message)
+        self.assertIn("RAG 是检索增强生成。", user_message)
+        self.assertIn("用户问题", user_message)
+        self.assertIn("解释 RAG", user_message)
+
     def test_deepseek_provider_remains_as_compatibility_alias(self):
         from modules.llm.provider import DeepSeekLLMProvider
 

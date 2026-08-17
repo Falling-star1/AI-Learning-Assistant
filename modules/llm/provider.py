@@ -232,14 +232,22 @@ class OllamaLLMProvider:
     ) -> LLMResult:
         payload = {
             "model": self.model_name,
-            "prompt": _build_ollama_prompt(prompt, context_chunks, conversation_history),
+            "messages": _build_chat_messages(
+                prompt,
+                context_chunks,
+                system_prompt=self._system_prompt(),
+                conversation_history=conversation_history,
+            ),
             "stream": False,
         }
-        response = self.client(f"{self.base_url}/api/generate", payload)
-        text = str(response.get("response", "")).strip()
+        response = self.client(f"{self.base_url}/api/chat", payload)
+        text = str(response.get("message", {}).get("content", "")).strip()
         if not text:
             raise RuntimeError(f"本地模型返回格式无法解析：{response}")
         return LLMResult(text=text, provider=self.provider_name, used_remote_model=False)
+
+    def _system_prompt(self) -> str:
+        return "你是 Ollama 本地模型驱动的 AI 多模态学习助手，请结合历史对话和课程资料回答。"
 
     def _default_client(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -317,22 +325,6 @@ def _normalize_conversation_history(
             continue
         normalized.append({"role": role, "content": content})
     return normalized[-8:]
-
-
-def _build_ollama_prompt(
-    prompt: str,
-    context_chunks: Sequence[str] | None,
-    conversation_history: Sequence[dict[str, str]] | None,
-) -> str:
-    history = _normalize_conversation_history(conversation_history)
-    user_message = _build_user_message(prompt, context_chunks)
-    if not history:
-        return user_message
-    history_text = "\n".join(
-        f"{'用户' if message['role'] == 'user' else '助手'}：{message['content']}"
-        for message in history
-    )
-    return f"历史对话：\n{history_text}\n\n当前问题：\n{user_message}"
 
 
 def _build_user_message(prompt: str, context_chunks: Sequence[str] | None) -> str:
